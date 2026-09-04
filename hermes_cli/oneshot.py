@@ -478,6 +478,13 @@ def _run_agent(
     skills_prompt = _build_preloaded_skills_prompt(skills)
 
     session_db = _create_session_db_for_oneshot()
+    # One-shot is used by the benchmark runner, not only interactive ad-hoc
+    # invocations.  Preserve the profile's explicit execution limits here;
+    # otherwise AIAgent falls back to effectively unlimited iterations and
+    # bypasses the same guardrails used by the normal CLI route.
+    _agent_cfg = cfg.get("agent") if isinstance(cfg.get("agent"), dict) else {}
+    _oneshot_max_turns = _agent_cfg.get("max_turns")
+    _oneshot_run_budget = _agent_cfg.get("run_budget_seconds")
     # The try spans agent construction (not just ``chat``) so the SQLite store
     # opened above is always closed — including when ``AIAgent(...)`` itself
     # raises on a provider/config error. The one-shot exit path hard-exits via
@@ -496,6 +503,12 @@ def _run_agent(
             requested_provider=runtime.get("requested_provider"),
             api_mode=runtime.get("api_mode"),
             model=effective_model,
+            # Keep one-shot runs consistent with interactive/gateway routes:
+            # custom provider output caps must reach AIAgent rather than
+            # silently defaulting to an unbounded generation.
+            max_tokens=(runtime.get("max_tokens") or runtime.get("max_output_tokens") or None),
+            max_iterations=_oneshot_max_turns,
+            run_budget_seconds=_oneshot_run_budget,
             enabled_toolsets=toolsets_list,
             quiet_mode=True,
             platform="cli",
