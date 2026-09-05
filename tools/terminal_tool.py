@@ -2965,7 +2965,10 @@ def terminal_tool(
         else:
             image = ""
 
-        cwd = overrides.get("cwd") or get_session_cwd(task_id) or config["cwd"]
+        # Gateway tool calls may carry the conversation session in session_id
+        # while task_id is unset; use that session's explicit cwd before the
+        # profile default so project work never falls back to gateway cwd.
+        cwd = overrides.get("cwd") or get_session_cwd(task_id or session_id) or config["cwd"]
         # Session-scoped mount resolution (single owner: _resolve_task_host_cwd).
         # Under per-session isolation a fresh session must not inherit the
         # process-global TERMINAL_CWD mount left behind by a previous session.
