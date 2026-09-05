@@ -57,6 +57,11 @@ def _session_cwd_override() -> str:
     return str(value).strip()
 
 
+def session_cwd_override() -> str:
+    """Return the current session's explicitly bound cwd, if any."""
+    return _session_cwd_override()
+
+
 def _terminal_cwd_env() -> str:
     """Scope-aware TERMINAL_CWD read (tools.terminal_scope.terminal_env).
 

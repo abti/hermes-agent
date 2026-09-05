@@ -304,15 +304,27 @@ def _authoritative_workspace_root(task_id: str = "default") -> str | None:
     """
     try:
         from tools.terminal_tool import get_session_cwd
-
-        recorded = get_session_cwd(task_id)
+        from gateway.session_context import get_session_env
+        keys = [task_id]
+        session_id = get_session_env("HERMES_SESSION_ID", "")
+        session_key = get_session_env("HERMES_SESSION_KEY", "")
+        for key in (session_id, session_key):
+            if key and key not in keys:
+                keys.append(key)
+        for key in keys:
+            recorded = get_session_cwd(key)
+            if recorded:
+                return recorded
+        for key in keys:
+            registered = _registered_task_cwd_override(key)
+            if registered:
+                return registered
+        from agent.runtime_cwd import session_cwd_override
+        bound = _sentinel_free_abs_cwd(session_cwd_override())
+        if bound:
+            return bound
     except Exception:
-        recorded = None
-    if recorded:
-        return recorded
-    registered = _registered_task_cwd_override(task_id)
-    if registered:
-        return registered
+        pass
     return _configured_terminal_cwd()
 
 

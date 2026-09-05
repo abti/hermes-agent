@@ -2861,7 +2861,16 @@ def _resolve_command_cwd(
             recorded, env_type, default_cwd,
         )
         return default_cwd
-    return recorded or default_cwd
+    if recorded:
+        return recorded
+    try:
+        from agent.runtime_cwd import session_cwd_override
+        bound = session_cwd_override()
+        if bound:
+            return bound
+    except Exception:
+        pass
+    return default_cwd
 
 
 def terminal_tool(
@@ -2965,10 +2974,21 @@ def terminal_tool(
         else:
             image = ""
 
+        from tools.approval import get_current_session_key
+
         # Gateway tool calls may carry the conversation session in session_id
         # while task_id is unset; use that session's explicit cwd before the
         # profile default so project work never falls back to gateway cwd.
-        cwd = overrides.get("cwd") or get_session_cwd(task_id or session_id) or config["cwd"]
+        # The executor's task_id is a per-turn UUID; the durable session_id
+        # (or approval session key) is the cwd-record identity.
+        session_key = get_current_session_key(default="") or session_id or task_id or ""
+        from agent.runtime_cwd import session_cwd_override
+        cwd = (
+            overrides.get("cwd")
+            or get_session_cwd(session_key)
+            or session_cwd_override()
+            or config["cwd"]
+        )
         # Session-scoped mount resolution (single owner: _resolve_task_host_cwd).
         # Under per-session isolation a fresh session must not inherit the
         # process-global TERMINAL_CWD mount left behind by a previous session.
@@ -3123,9 +3143,7 @@ def terminal_tool(
         # contextvar doesn't cross tool-worker threads, so fall back to the raw
         # task_id (which IS the session_key for the top-level agent) — a
         # stable, thread-safe anchor.
-        from tools.approval import get_current_session_key
-
-        session_key = get_current_session_key(default="") or (task_id or "")
+        session_key = get_current_session_key(default="") or session_id or (task_id or "")
 
         # Hard-block: gateway lifecycle commands (systemctl/launchctl/hermes
         # restart|stop|uninstall targeting hermes-gateway) must never run inside the

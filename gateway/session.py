@@ -341,6 +341,7 @@ class SessionContext:
     session_id: str = ""
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
+    workspace_path: str = ""
     
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -354,6 +355,7 @@ class SessionContext:
             "session_id": self.session_id,
             "created_at": self.created_at.isoformat() if self.created_at else None,
             "updated_at": self.updated_at.isoformat() if self.updated_at else None,
+            "workspace_path": self.workspace_path,
         }
 
 
@@ -4570,5 +4572,8 @@ def build_session_context(
         context.session_id = session_entry.session_id
         context.created_at = session_entry.created_at
         context.updated_at = session_entry.updated_at
+        context.workspace_path = str(
+            session_entry.metadata.get("workspace_path") or ""
+        )
     
     return context

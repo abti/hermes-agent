@@ -2297,6 +2297,26 @@ def _resolve_child_cwd(mode: str, staging_dir: str, task_id: str = "") -> str:
             session_cwd = None
         if session_cwd and os.path.isdir(session_cwd):
             return session_cwd
+    try:
+        from gateway.session_context import get_session_env
+        from tools.terminal_tool import get_session_cwd
+        for key in (
+            get_session_env("HERMES_SESSION_ID", ""),
+            get_session_env("HERMES_SESSION_KEY", ""),
+        ):
+            if key:
+                recorded = get_session_cwd(key)
+                if recorded and os.path.isdir(recorded):
+                    return recorded
+    except Exception:
+        pass
+    try:
+        from agent.runtime_cwd import session_cwd_override
+        bound = session_cwd_override()
+        if bound and os.path.isdir(bound):
+            return bound
+    except Exception:
+        pass
     from agent.runtime_cwd import scope_terminal_cwd
 
     raw = scope_terminal_cwd().strip()

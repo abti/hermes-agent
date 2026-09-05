@@ -35,6 +35,7 @@ from typing import Iterable, List, Optional
 
 from hermes_cli.sqlite_util import add_column_if_missing as _add_column_if_missing, write_txn
 from hermes_constants import get_hermes_home
+from hermes_cli.project_workspace import resolve_or_create_workspace
 
 # ---------------------------------------------------------------------------
 # Paths
@@ -389,6 +390,12 @@ def create_project(
         folder_paths.insert(0, primary)
     if primary is None and folder_paths:
         primary = folder_paths[0]
+    if primary is None:
+        # A named project without linked folders still needs an isolated,
+        # persistent project root. Do not turn the shared projects container
+        # itself into the project's cwd.
+        primary = resolve_or_create_workspace(project_name=name)
+        folder_paths.append(primary)
 
     if primary and not allow_duplicate_path:
         existing = find_by_primary_path(conn, primary)

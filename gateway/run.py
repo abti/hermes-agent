@@ -21408,7 +21408,44 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "session_id": session_entry.session_id,
                 "session_key": session_key,
             })
-        
+
+        # Resolve the session workspace once, before agent construction.  The
+        # gateway process cwd is never a project cwd: linked paths are
+        # authoritative and unlinked sessions get their own persistent
+        # directory below the Hermes projects container.
+        try:
+            from hermes_cli.project_workspace import resolve_or_create_workspace
+
+            metadata = session_entry.metadata
+            workspace = str(metadata.get("workspace_path") or "").strip()
+            linked = (
+                metadata.get("linked_directory")
+                or metadata.get("linked_repo")
+                or metadata.get("project_path")
+            )
+            workspace = await asyncio.to_thread(
+                resolve_or_create_workspace,
+                linked_directory=str(linked).strip() if linked else None,
+                workspace_path=workspace or None,
+                project_name=(
+                    session_entry.display_name
+                    or source.chat_name
+                    or ""
+                ),
+                session_id=session_entry.session_id,
+            )
+            if metadata.get("workspace_path") != workspace:
+                await self.async_session_store.set_session_metadata(
+                    session_key, "workspace_path", workspace
+                )
+            session_entry.metadata["workspace_path"] = workspace
+        except Exception as exc:
+            logger.error(
+                "Session workspace resolution failed for %s: %s",
+                session_entry.session_id, exc,
+            )
+            return f"Project workspace unavailable: {exc}"
+
         # Build session context
         context = build_session_context(source, self.config, session_entry)
         
@@ -27594,6 +27631,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             session_key=context.session_key,
             message_id=str(context.source.message_id) if context.source.message_id else "",
             profile=getattr(context.source, "profile", "") or "",
+            cwd=getattr(context, "workspace_path", "") or "",
             async_delivery=_async_delivery,
             cron_session="",
         )
