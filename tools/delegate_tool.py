@@ -408,6 +408,10 @@ def delegate_task(
     if parent_agent is None:
         return tool_error("delegate_task requires a parent agent context.")
 
+    from agent.task_runtime_contract import ensure_binding
+    _control_identity = getattr(parent_agent, "_control_task_id", None)
+    runtime_ledger = ensure_binding(parent_agent) if isinstance(_control_identity, str) and _control_identity.strip() else None
+
     normalized_action = (action or "").strip().lower()
     if normalized_action in _CONTROL_ACTIONS:
         return _handle_control_action(normalized_action, subagent_id, message, parent_agent)
@@ -459,6 +463,23 @@ def delegate_task(
     if err:
         return tool_error(err)
 
+    # Issue-bound validation runs are stricter than the general configured
+    # fan-out limit: cardinality belongs to the persisted operation, not to a
+    # model-generated batch or a later retry.
+    if runtime_ledger is not None and runtime_ledger.binding.control_task_id:
+        runtime_ledger.max_children = 1
+    elif runtime_ledger is not None:
+        runtime_ledger.max_children = max_children
+    child_ids = []
+    if runtime_ledger is not None:
+        try:
+            for index, task in enumerate(task_list):
+                child_ids.append(runtime_ledger.begin_child(str(task.get("child_scope_key") or f"task-{index}")))
+        except (RuntimeError, ValueError) as exc:
+            for child_id in child_ids:
+                runtime_ledger.abort_child(child_id)
+            return tool_error(str(exc))
+
     overall_start = time.monotonic()
     # Live transcripts: cache/delegation/live/<id>/task-<n>.log per task, a side channel with zero effect on message
     # content or prompt caching. Best-effort: on failure live_paths is empty and delegation proceeds.
@@ -474,7 +495,18 @@ def delegate_task(
         live_deleg_id=live_deleg_id, live_writers=live_writers,
     )
     if err:
+        for child_id in child_ids:
+            runtime_ledger.abort_child(child_id)
         return tool_error(err)
+    for child_id, (_, _, child) in zip(child_ids, children):
+        child._task_runtime_child_id = child_id
+        child._task_runtime_ledger = runtime_ledger
+        from agent.task_runtime_contract import make_envelope
+        child._task_runtime_envelope = make_envelope(
+            runtime_ledger.binding, child_task_id=child_id, model=str(creds.get("model") or ""),
+            provider=str(creds.get("provider") or ""), allowed_paths=[runtime_ledger.binding.workspace_cwd] if runtime_ledger.binding.workspace_cwd else [],
+            mutation_mode="read-only" if runtime_ledger.binding.control_task_id else "configured",
+        )
     batch = _Batch(
         task_list, children, parent_agent, creds, context, top_role, max_children,
         live_deleg_id, live_writers, live_paths, *origin, overall_start,

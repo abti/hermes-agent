@@ -1491,6 +1491,20 @@ def _resolve_sequential_dispatch(agent, ref: _ToolCallRef, messages: list) -> _S
     function_name, function_args, effective_task_id, tool_call_id, middleware_trace = (
         ref.name, ref.args, ref.task_id, ref.call_id, ref.trace,
     )
+    # A delegated parent is a supervisor while its child is live.  Fail closed
+    # before registry lookup so filesystem/GitHub exploration cannot sneak in
+    # through a tool unknown to the delegation prompt.
+    try:
+        from agent.task_runtime_contract import ensure_binding, tool_allowed_while_waiting
+        _control_identity = getattr(agent, "_control_task_id", None)
+        runtime_ledger = ensure_binding(agent) if isinstance(_control_identity, str) and _control_identity.strip() else None
+        if runtime_ledger is not None and runtime_ledger.state == "WAITING_CHILD" and not tool_allowed_while_waiting(function_name):
+            reason = f"tool '{function_name}' rejected while parent is WAITING_CHILD; supervise or read the child result"
+            return _SequentialDispatch(execute=lambda _args: reason, error_result=lambda exc: reason)
+    except Exception:
+        # Runtime policy is additive for ordinary agents; never make a legacy
+        # unbound session unavailable because a policy probe failed.
+        pass
     if function_name != "delegate_task" and function_name in INLINE_TOOL_EXECUTORS:
         # Agent-level tools that need live AIAgent state; table shared with invoke_tool.
         inline_executor = INLINE_TOOL_EXECUTORS[function_name]

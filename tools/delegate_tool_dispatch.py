@@ -160,6 +160,23 @@ def _execute_and_aggregate(batch: _Batch, *, honor_parent_interrupt: bool = True
         _run_children_parallel(batch, results, honor_parent_interrupt=honor_parent_interrupt)
 
     _finalize_child_results(results, batch.task_list, batch.children, batch.parent_agent)
+    # Close the operation only after every child result has been joined.  This
+    # makes a retry/resume observe the same ownership ledger and prevents a
+    # second delegation from racing the first child's return.
+    runtime_ledger = getattr(batch.parent_agent, "_task_runtime_ledger", None)
+    if runtime_ledger is not None:
+        for entry, (_, _, child) in zip(results, batch.children):
+            child_id = getattr(child, "_task_runtime_child_id", None)
+            if not child_id:
+                continue
+            envelope = getattr(child, "_task_runtime_envelope", None)
+            if isinstance(entry, dict) and isinstance(envelope, dict):
+                entry["runtime_provenance"] = dict(envelope)
+            try:
+                runtime_ledger.finish_child(child_id, entry if isinstance(entry, dict) else {"result": entry})
+                runtime_ledger.resume_parent(child_id)
+            except (RuntimeError, ValueError):
+                logger.exception("task runtime child transition failed for %s", child_id)
     total_duration = round(time.monotonic() - batch.overall_start, 2)
     for entry in results:
         _idx = entry.get("task_index", -1)
