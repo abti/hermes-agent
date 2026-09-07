@@ -79,7 +79,25 @@ def bootstrap_issue_task(identity: TaskIdentity, *, project_cwd: Optional[str] =
     if int(issue.get("number", -1)) != identity.issue:
         raise RuntimeError("authenticated issue response did not match requested issue")
     cwd = os.path.abspath(project_cwd or os.getcwd())
-    remote = _run_text(["git", "remote", "get-url", "origin"], cwd=cwd)
+    try:
+        remote = _run_text(["git", "remote", "get-url", "origin"], cwd=cwd)
+    except (OSError, subprocess.CalledProcessError):
+        remote = ""
+    # The Mac client may start a session from the neutral projects root. Find
+    # the already-created exact repo there, but never guess across remotes.
+    if _repo_name_from_remote(remote) != identity.full_name.lower():
+        root = Path("/home/hermes/projects")
+        candidates = [root / identity.repo, root / f"{identity.owner}-{identity.repo}"]
+        for candidate in candidates:
+            if not candidate.is_dir():
+                continue
+            try:
+                candidate_remote = _run_text(["git", "remote", "get-url", "origin"], cwd=str(candidate))
+            except (OSError, subprocess.CalledProcessError):
+                continue
+            if _repo_name_from_remote(candidate_remote) == identity.full_name.lower():
+                cwd, remote = str(candidate), candidate_remote
+                break
     if _repo_name_from_remote(remote) != identity.full_name.lower():
         raise RuntimeError(f"task repo mismatch: expected {identity.full_name}, found {_repo_name_from_remote(remote) or '<none>'}")
     state_path = _state_path(identity, state_root)
