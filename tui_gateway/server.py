@@ -13577,6 +13577,37 @@ def _run_prompt_submit(
             if display_kind and "persist_user_display_kind" in _run_params:
                 run_kwargs["persist_user_display_kind"] = display_kind
                 run_kwargs["persist_user_display_metadata"] = display_metadata
+            # The desktop/Mac client uses the TUI gateway turn path rather
+            # than the HTTP API adapter. Apply the same deterministic issue
+            # bootstrap here so natural-language UX launches cannot bypass
+            # authenticated control-plane retrieval and repo binding.
+            task_runtime_state = None
+            task_runtime_prompt = None
+            task_identity = None
+            try:
+                from agent.issue_task_runtime import (
+                    bootstrap_issue_task,
+                    format_task_context,
+                    parse_task_identity,
+                )
+                task_identity = parse_task_identity(prompt)
+                if task_identity:
+                    from agent.runtime_cwd import session_cwd_override
+                    task_runtime_state = bootstrap_issue_task(
+                        task_identity,
+                        project_cwd=(
+                            session_cwd_override()
+                            or getattr(agent, "cwd", None)
+                            or getattr(agent, "working_directory", None)
+                            or os.getcwd()
+                        ),
+                    )
+                    task_runtime_prompt = format_task_context(task_runtime_state)
+            except Exception:
+                if task_identity is not None:
+                    raise
+            if task_runtime_prompt:
+                run_kwargs["system_message"] = task_runtime_prompt
             # Auto-titling now fires inside the turn prologue (shared by every
             # surface). Hand the agent this session's live-rename hook so the
             # sidebar repaints the moment a title lands, rather than waiting
@@ -13600,6 +13631,25 @@ def _run_prompt_submit(
                 # message.complete.
                 _usage_stop.set()
                 _usage_thread.join()
+            # A normal GPT-OSS stop is a checkpoint, not task completion. Keep
+            # continuation bounded and reuse the authenticated task context.
+            if task_runtime_state is not None:
+                from agent.issue_task_runtime import should_auto_continue
+                if should_auto_continue(task_runtime_state, result):
+                    continuation_kwargs = dict(run_kwargs)
+                    continuation_kwargs["conversation_history"] = (
+                        result.get("messages", history)
+                        if isinstance(result, dict)
+                        else history
+                    )
+                    continuation = (
+                        "Continue the active issue task from the current state. "
+                        "The previous response was a checkpoint, not completion. "
+                        "Perform the next unfinished acceptance criterion now; "
+                        "do not repeat already-verified bootstrap searches."
+                    )
+                    continuation_kwargs["persist_user_message"] = continuation
+                    result = agent.run_conversation(continuation, **continuation_kwargs)
             if display_kind and isinstance(text, str):
                 db = getattr(agent, "_session_db", None)
                 current_session_id = getattr(agent, "session_id", None) or session.get("session_key")
