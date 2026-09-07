@@ -7494,11 +7494,73 @@ class APIServerAdapter(BasePlatformAdapter):
                     # ``agent_ref``, and only /v1/runs has a run_id, so neither
                     # is a usable hook for the rest.
                     self._shutdown_interruptible_agents[id(agent)] = agent
+                    # The desktop client intentionally sends natural-language
+                    # text. If it contains a GitHub issue identity, bootstrap
+                    # the authenticated contract before the first model call
+                    # so UX launches and CLI launches share one lifecycle.
+                    task_runtime_state = None
+                    task_runtime_prompt = None
+                    task_identity = None
+                    try:
+                        from agent.issue_task_runtime import (
+                            bootstrap_issue_task,
+                            format_task_context,
+                            parse_task_identity,
+                        )
+
+                        task_identity = parse_task_identity(user_message)
+                        if task_identity:
+                            from agent.runtime_cwd import session_cwd_override
+
+                            task_runtime_state = bootstrap_issue_task(
+                                task_identity,
+                                project_cwd=session_cwd_override()
+                                or getattr(agent, "cwd", None)
+                                or getattr(agent, "working_directory", None)
+                                or os.getcwd(),
+                            )
+                            task_runtime_prompt = format_task_context(task_runtime_state)
+                            logger.info(
+                                "Issue task runtime bootstrapped %s for session=%s",
+                                task_identity.key,
+                                session_id or "-",
+                            )
+                    except Exception:
+                        # A recognized issue must fail closed before model
+                        # execution; do not let the model invent a public-web
+                        # bootstrap or bind the wrong repository.
+                        if task_identity is not None:
+                            raise
+                    runtime_system_message = ephemeral_system_prompt
+                    if task_runtime_prompt:
+                        runtime_system_message = (
+                            ((runtime_system_message + "\n\n") if runtime_system_message else "")
+                            + task_runtime_prompt
+                        )
                     result = agent.run_conversation(
                         user_message=user_message,
                         conversation_history=conversation_history,
                         task_id=effective_task_id,
+                        system_message=runtime_system_message,
                     )
+                    # GPT-OSS can return a normal stop after a checkpoint. One
+                    # bounded continuation preserves the task contract without
+                    # creating an unbounded retry loop.
+                    if task_runtime_state is not None:
+                        from agent.issue_task_runtime import should_auto_continue
+
+                        if should_auto_continue(task_runtime_state, result):
+                            result = agent.run_conversation(
+                                user_message=(
+                                    "Continue the active issue task from the current state. "
+                                    "The previous response was a checkpoint, not completion. "
+                                    "Perform the next unfinished acceptance criterion now; "
+                                    "do not repeat already-verified bootstrap searches."
+                                ),
+                                conversation_history=result.get("messages", conversation_history),
+                                task_id=effective_task_id,
+                                system_message=runtime_system_message,
+                            )
                     usage = {
                         "input_tokens": getattr(agent, "session_prompt_tokens", 0) or 0,
                         "output_tokens": getattr(agent, "session_completion_tokens", 0) or 0,
