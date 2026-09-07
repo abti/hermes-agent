@@ -46,6 +46,32 @@ from tools.terminal_tool import set_approval_callback as _set_subagent_approval_
 from utils import base_url_hostname, is_truthy_value
 
 
+# Every delegated child has a machine-readable return contract.  Callers can
+# still provide a stricter per-task schema; this is the safe shared baseline.
+DEFAULT_CHILD_OUTPUT_SCHEMA = {
+    "type": "object",
+    "additionalProperties": True,
+    "required": [
+        "child_task_id", "parent_task_id", "status", "summary", "evidence",
+        "files_changed", "commits", "tests", "blockers",
+        "next_recommendation", "scope_violations",
+    ],
+    "properties": {
+        "child_task_id": {"type": "string"},
+        "parent_task_id": {"type": "string"},
+        "status": {"enum": ["success", "partial", "blocked", "failed"]},
+        "summary": {"type": "string"},
+        "evidence": {"type": "array"},
+        "files_changed": {"type": "array"},
+        "commits": {"type": "array"},
+        "tests": {"type": "array"},
+        "blockers": {"type": "array"},
+        "next_recommendation": {"type": "string"},
+        "scope_violations": {"type": "array"},
+    },
+}
+
+
 # Tools that children must never have access to
 DELEGATE_BLOCKED_TOOLS = frozenset(
     [
@@ -1761,6 +1787,7 @@ def _build_child_agent(
     # ACP transport overrides from trusted delegation config.
     override_acp_command: Optional[str] = None,
     override_acp_args: Optional[List[str]] = None,
+    output_schema: Optional[Dict[str, Any]] = None,
     # Per-call role controlling whether the child can further delegate.
     # 'leaf' (default) cannot; 'orchestrator' retains the delegation
     # toolset subject to depth/kill-switch bounds applied below.
@@ -1799,6 +1826,19 @@ def _build_child_agent(
     tui_depth = max(0, child_depth - 1)  # 0 = first-level child for the UI
 
     delegation_cfg = _load_config()
+
+    # Build the canonical handoff before model construction.  The envelope is
+    # immutable task identity, not prompt prose; the same object is bound to
+    # the child tool dispatcher and its redacted hash/path are parent-visible.
+    from agent.delegation_contract import build_child_envelope
+    _child_schema = output_schema or DEFAULT_CHILD_OUTPUT_SCHEMA
+    _envelope, _envelope_hash, _envelope_path = build_child_envelope(
+        parent_agent,
+        goal=goal,
+        context=context or "",
+        child_task_id=subagent_id,
+        output_schema=_child_schema,
+    )
 
     # When no explicit toolsets given, inherit from parent's enabled toolsets
     # so disabled tools (e.g. web) don't leak to subagents.
@@ -1874,6 +1914,13 @@ def _build_child_agent(
         role=effective_role,
         max_spawn_depth=max_spawn,
         child_depth=child_depth,
+    )
+    child_prompt += (
+        "\n\nRUNTIME DELEGATION ENVELOPE (authoritative; do not broaden):\n"
+        + json.dumps(_envelope, sort_keys=True, ensure_ascii=False)
+        + "\nThe parent owns continuation. Ignore empty/garbled messages unless "
+        "they are explicit control events. Return ONLY the machine-validated "
+        "JSON object required by the output contract."
     )
     # Extract parent's API key so subagents inherit auth (e.g. Nous Portal).
     parent_api_key = getattr(parent_agent, "api_key", None)
@@ -2194,6 +2241,10 @@ def _build_child_agent(
     child._subagent_id = subagent_id
     child._parent_subagent_id = parent_subagent_id
     child._subagent_goal = goal
+    child._delegate_output_schema = _child_schema
+    child._delegation_envelope = _envelope
+    child._delegation_envelope_hash = _envelope_hash
+    child._delegation_envelope_path = _envelope_path
     child._parent_turn_id = getattr(parent_agent, "_current_turn_id", "") or ""
     # Ownership chain for the model-facing control plane (action=list/steer/
     # stop): a parent may only control agents whose weakref chain reaches it.
@@ -3003,13 +3054,15 @@ def _run_single_child(
         def _run_with_thread_capture():
             _worker_thread_holder["t"] = threading.current_thread()
             from agent.delegation_context import delegated_child_context
+            from agent.delegation_contract import bind
 
             with delegated_child_context(str(getattr(child, "session_id", "") or "")):
-                return child.run_conversation(
-                    user_message=goal,
-                    task_id=child_task_id,
-                    stream_callback=_relay_child_text,
-                )
+                with bind(getattr(child, "_delegation_envelope", {}) or {}):
+                    return child.run_conversation(
+                        user_message=goal,
+                        task_id=child_task_id,
+                        stream_callback=_relay_child_text,
+                    )
 
         _child_context = contextvars.copy_context()
         _child_future = _timeout_executor.submit(
@@ -3227,11 +3280,13 @@ def _run_single_child(
                 _schema_retries = 1
                 _retry_result = None
                 try:
-                    _retry_result = child.run_conversation(
-                        user_message=build_retry_message(_schema_errors),
-                        task_id=child_task_id,
-                        stream_callback=_relay_child_text,
-                    )
+                    from agent.delegation_contract import bind
+                    with bind(getattr(child, "_delegation_envelope", {}) or {}):
+                        _retry_result = child.run_conversation(
+                            user_message=build_retry_message(_schema_errors),
+                            task_id=child_task_id,
+                            stream_callback=_relay_child_text,
+                        )
                 except Exception as _retry_exc:
                     logger.warning(
                         "Subagent %d schema-retry turn failed: %s",
@@ -3436,6 +3491,13 @@ def _run_single_child(
         entry["cost_status"] = (
             _cost_status if isinstance(_cost_status, str) and _cost_status
             else "unknown"
+        )
+        entry["child_task_id"] = _subagent_id or child_task_id
+        entry["parent_task_id"] = str(getattr(parent_agent, "session_id", "") or "")
+        entry["envelope_sha256"] = getattr(child, "_delegation_envelope_hash", "")
+        entry["envelope_path"] = getattr(child, "_delegation_envelope_path", None)
+        entry["scope_violations"] = list(
+            (getattr(child, "_delegation_envelope", {}) or {}).get("scope_violations", [])
         )
         if status == "failed":
             if _schema_valid is False and summary and not _empty_sentinel:
@@ -4079,6 +4141,18 @@ def delegate_task(
     if not task_list:
         return tool_error("No tasks provided.")
 
+    # GPT-OSS and older cached tool schemas have emitted the semantically
+    # equivalent `description`/`objective` keys. Normalize those aliases at
+    # the runtime boundary so a malformed first attempt cannot trigger a
+    # second, conflicting delegation call. The canonical child envelope still
+    # records the normalized objective and parent identity.
+    for task in task_list:
+        if isinstance(task, dict) and not str(task.get("goal") or "").strip():
+            for alias in ("objective", "description", "task", "prompt"):
+                if str(task.get(alias) or "").strip():
+                    task["goal"] = task[alias]
+                    break
+
     # Validate each task has a goal
     for i, task in enumerate(task_list):
         if not isinstance(task, dict):
@@ -4098,22 +4172,20 @@ def delegate_task(
         if batch_error:
             return tool_error(batch_error)
 
-    # T1-24: coerce/validate optional per-task output_schema up front so a
-    # malformed schema fails the whole call loudly instead of spawning
-    # children that can never satisfy their contract. Runs AFTER the
-    # existing goal checks; schema-less tasks resolve to None and take no
-    # new code paths downstream.
+    # Coerce/validate the per-task output schema up front.  Unlike the old
+    # optional-only behavior, every child gets the shared structured return
+    # contract unless the caller supplied a stricter schema.
     from tools.delegation_output_schema import coerce_output_schema
 
     task_schemas: List[Optional[Dict[str, Any]]] = []
     for i, task in enumerate(task_list):
-        raw_schema = task.get("output_schema")
+        raw_schema = task.get("output_schema") or DEFAULT_CHILD_OUTPUT_SCHEMA
         if raw_schema is None and len(task_list) == 1 and output_schema is not None:
             raw_schema = output_schema
         coerced_schema, schema_err = coerce_output_schema(raw_schema)
         if schema_err:
             return tool_error(f"Task {i} output_schema invalid: {schema_err}")
-        task_schemas.append(coerced_schema)
+        task_schemas.append(coerced_schema or DEFAULT_CHILD_OUTPUT_SCHEMA)
 
     overall_start = time.monotonic()
     results = []
@@ -4208,6 +4280,7 @@ def delegate_task(
                 override_max_tokens=creds.get("max_output_tokens"),
                 override_acp_command=creds.get("command"),
                 override_acp_args=creds.get("args"),
+                output_schema=_task_schema,
                 role=effective_role,
             )
         except ValueError as exc:

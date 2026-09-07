@@ -3541,6 +3541,25 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
     if not isinstance(function_args, dict):
         function_args = {}
 
+    # Delegated children are guarded at the shared dispatcher boundary, before
+    # plugin/middleware or the concrete tool can act.  This keeps read-only and
+    # path allowlists effective even when a model emits a direct terminal/file
+    # call instead of following the handoff prose.
+    try:
+        from agent.delegation_contract import current as _delegation_contract
+        from agent.delegation_contract import guard_tool as _guard_delegation_tool
+        _contract = _delegation_contract()
+        _scope_error = _guard_delegation_tool(function_name, function_args)
+        if _scope_error:
+            _contract.setdefault("scope_violations", []).append(_scope_error)
+            return json.dumps({
+                "error": _scope_error,
+                "scope_violation": True,
+                "child_task_id": _contract.get("child_task_id", ""),
+            }, ensure_ascii=False)
+    except Exception as _scope_guard_error:
+        logger.warning("delegation scope guard unavailable: %s", _scope_guard_error)
+
     _tool_middleware_trace = list(tool_request_middleware_trace or [])
     try:
         from hermes_cli.middleware import apply_tool_request_middleware
